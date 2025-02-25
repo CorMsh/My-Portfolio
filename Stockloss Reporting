@@ -1,0 +1,546 @@
+-- Creating a single view for Stockloss reporting
+
+create or replace view RI_SANDL_DB.RAW_DATA.POWER_BI_STOCKTAKE_LOSS_VW as (
+
+-- =====================================================================================================================================================================================
+-- =====================================================================================================================================================================================
+-- Reporting the manual way - STOCKLOSS
+-- =====================================================================================================================================================================================
+-- =====================================================================================================================================================================================
+
+-- 1. Obtaining the MD surplus figures from 2023 P11 - 13 so that this can be added to the MD figures this year
+
+with MD_Surplus as (
+
+select
+
+    wslv.location_id,
+    wslv.dept_id,
+    sum(case when wslv.loss_cost_gbp_md_exjob > 0 then wslv.loss_cost_gbp_md_exjob else 0 end)     LY_LOSS_VALUE_SURPLUS,
+    sum(case when wslv.sales_value_gbp_md > 0 then wslv.sales_value_gbp_md else 0 end)             LY_SALES_VALUE_SURPLUS,
+    sum(case when wslv.loss_units_md_exjob > 0 then wslv.loss_units_md_exjob else 0 end)           LY_LOSS_UNITS_SURPLUS,
+    sum(case when wslv.sales_units_md > 0 then wslv.sales_units_md else 0 end)                     LY_SALES_UNITS_SURPLUS
+
+from "RI_SANDL_DB"."RAW_DATA"."WEEKLY_STOCKTAKE_LOSS_VW" wslv
+
+join (select distinct
+
+    merch_yr_wk,
+    fin_yr_pd
+
+from "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_TIME") dmt
+on dmt.merch_yr_wk = wslv.merch_yr_wk
+
+join "RI_SANDL_DB"."RAW_DATA"."LU_LOCATION_ID_RRM_CLOSED" rrmc
+on rrmc.storenumber = wslv.location_id
+
+where wslv.dept_id not in (132,230,517)
+ 
+and rrmc.closed is null 
+and dmt.fin_yr_pd between 202311 and 202313
+
+
+group by
+
+    wslv.location_id,
+    wslv.dept_id
+
+order by
+
+     wslv.location_id,
+     wslv.dept_id
+
+),
+
+-- 2. Now the main query
+-- Query that automatically gets the weeks needed
+
+weeks as (
+
+select distinct
+
+    merch_yr_wk,
+    right(fin_yr_pd,2) period_number
+
+from "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_TIME"
+
+where fin_yr IN (2024,2025)
+and cal_dt <= current_date() - 7
+
+group by 
+    merch_yr_wk,
+    fin_yr_pd
+
+having right((select max(merch_yr_wk) last_week
+        
+        from "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_TIME" 
+        
+        where cal_dt <= current_date() - 7),2) >= max(right(merch_yr_wk,2)) 
+
+order by merch_yr_wk
+),
+
+-- Creating a CTE with all the store information
+
+locations as (
+
+select 
+
+    dmo.location_id,
+    dmo.location_descr,
+    dmo.area_descr          market,
+    dmo.district_descr      territory,
+    xsbv.total_site_status  LFL_STATUS,
+    xsbv.profile,
+    xsbv.finance_grading,
+    case when dmo.location_id in (59,120,153,170,250,253,268,330,373,712,752,874,885,45,244,119,163,222,217,17) then 'SCO' else 'Non-SCO' end      SCO_Flag, --ADD NEW LOCATIONS AS NECESSARY
+    case when rrmc.ranking is null then 'N' else 'Y' end                                                                                           ICP_Status,
+    case when dmo.location_id in (45,59,63,153,170,250,373,712,874,885,217,163) then 'Untagged' else 'Tagged' end     Tagging_Status, --ADD NEW LOCATIONS AS NECESSARY
+    dao.zip                                                                                                                                        Store_postcode,
+    dao.city,
+    dao.state                                                                                                                          
+
+from "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_ORG" dmo
+
+join "RI_SANDL_DB"."PUBLISHED_DATA"."LU_LOCATION_ID_RRM_CLOSED" rrmc
+on dmo.location_id = rrmc.storenumber
+
+join RI_NGBI_DB.PUBLISHED_DATA.ORGANISATION xsbv using (dmo.location_id)
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_ATTR_ORG" dao using (sk_location_id)
+
+where rrmc.closed is null
+),
+
+-- FULL PRICE COMPONENT
+
+full_price as (
+
+select
+
+    max(weeks.merch_yr_wk)                                                                                                            reporting_week,
+    max(weeks.period_number)                                                                                                          reporting_period,
+    dmo.territory,
+    dmo.market,
+    wslv.location_id,
+    dmo.location_descr,
+    dmo.LFL_STATUS,
+    dmo.profile,
+    dmo.finance_grading,
+    dmo.SCO_Flag, 
+    dmo.ICP_Status,
+    dmo.Tagging_Status,
+    case when WSLV.dept_id in (701,702,703,710,114,597,697,116,598,110,305,698,121,203,224) then 'Womenswear' else dpd.div_descr end  div_descr, 
+    CASE WHEN WSLV.dept_id in (701,702,703) then 710 --Moving departments aound and regrouping per request
+         when WSLV.dept_id in (114,597,697,116,598,110,305,698,121,203,224) then 1000 else wslv.dept_id end                           dept_id,
+    CASE WHEN WSLV.dept_id in (114,597,697,116,598,110,305,698,121,203,224) then 'OTHER' 
+         WHEN WSLV.dept_id in (701,702,703) then 'WW RI Beauty' else dpd.dept_descr end                                               dept_descr,
+    'FP'                                                                                                                              FP_MD,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 then wslv.loss_cost_gbp_fp_exjob else 0 end)                                        TY_LOSS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 and wslv.loss_cost_gbp_fp_exjob < 0 then wslv.loss_cost_gbp_fp_exjob else 0 end)    TY_LOSS_SHORTAGE,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 and wslv.loss_cost_gbp_fp_exjob > 0 then wslv.loss_cost_gbp_fp_exjob else 0 end)    TY_LOSS_SURPLUS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 then wslv.loss_cost_gbp_fp_exjob else 0 end)                                        LY_LOSS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 and wslv.loss_cost_gbp_fp_exjob < 0 then wslv.loss_cost_gbp_fp_exjob else 0 end)    LY_LOSS_SHORTAGE,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 and wslv.loss_cost_gbp_fp_exjob > 0 then wslv.loss_cost_gbp_fp_exjob else 0 end)    LY_LOSS_SURPLUS, 
+    TY_LOSS - LY_LOSS                                                                                                                 CHANGE_IN_LOSS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 then wslv.sales_value_gbp_fp else 0 end)                                            TY_SALES,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 then wslv.sales_value_gbp_fp else 0 end)                                            LY_SALES,
+    iff(TY_SALES = 0,0,TY_LOSS/TY_SALES)                                                                                              TY_LOSS_PCT_SALES,
+    iff(LY_SALES = 0,0,LY_LOSS/LY_SALES)                                                                                              LY_LOSS_PCT_SALES,
+    TY_LOSS_PCT_SALES - LY_LOSS_PCT_SALES                                                                                             CHANGE_IN_LOSS_PCT_SALES,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 then wslv.loss_units_fp else 0 end)                                                 TY_LOSS_UNITS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 and wslv.loss_units_fp < 0 then wslv.loss_units_fp else 0 end)                      TY_LOSS_SHORTAGE_units,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 and wslv.loss_units_fp > 0 then wslv.loss_units_fp else 0 end)                      TY_LOSS_SURPLUS_units,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 then wslv.loss_units_fp else 0 end)                                                 LY_LOSS_UNITS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 and wslv.loss_units_fp < 0 then wslv.loss_units_fp else 0 end)                      LY_LOSS_SHORTAGE_units,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 and wslv.loss_units_fp > 0 then wslv.loss_units_fp else 0 end)                      LY_LOSS_SURPLUS_units,
+    TY_LOSS_UNITS - LY_LOSS_UNITS                                                                                                     CHANGE_IN_LOSS_UNITS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 then wslv.sales_units_fp else 0 end)                                                TY_SALES_UNITS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 then wslv.sales_units_fp else 0 end)                                                LY_SALES_UNITS,
+    iff(TY_SALES_UNITS = 0,0,TY_LOSS_UNITS/TY_SALES_UNITS)                                                                            TY_LOSS_PCT_SALES_UNITS,
+    iff(LY_SALES_UNITS = 0,0,LY_LOSS_UNITS/LY_SALES_UNITS)                                                                            LY_LOSS_PCT_SALES_UNITS,
+    TY_LOSS_PCT_SALES_UNITS - LY_LOSS_PCT_SALES_UNITS                                                                                 CHANGE_IN_LOSS_PCT_SALES_UNITS
+
+from "RI_SANDL_DB"."RAW_DATA"."WEEKLY_STOCKTAKE_LOSS_VW" wslv
+
+join locations dmo using (location_id)
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_PRODUCT_DEPT" dpd
+on dpd.dept_id = wslv.dept_id
+
+join weeks
+on weeks.merch_yr_wk = wslv.merch_yr_wk
+
+where wslv.dept_id not in (132,230,517)
+
+group by
+
+    dmo.territory,
+    dmo.market,
+    wslv.location_id,
+    dmo.location_descr,
+    dmo.LFL_STATUS,
+    dmo.profile,
+    dmo.finance_grading,
+    dmo.SCO_Flag,
+    dmo.ICP_Status,
+    dmo.tagging_status,
+    dpd.div_descr,
+    wslv.dept_id,
+    dpd.dept_descr
+
+order by 
+
+    wslv.location_id,
+    wslv.dept_id
+
+),
+
+-- MARK DOWN COMPONENT
+
+markdown as (
+
+select
+
+    max(weeks.merch_yr_wk)                                                                                                                                      reporting_week,
+    max(weeks.period_number)                                                                                                                                    reporting_period,
+    dmo.territory,
+    dmo.market,
+    wslv.location_id,
+    dmo.location_descr,
+    dmo.LFL_STATUS,
+    dmo.profile,
+    dmo.finance_grading,
+    dmo.SCO_Flag, 
+    dmo.ICP_Status,
+    dmo.Tagging_Status,
+    case when WSLV.dept_id in (701,702,703,710,114,597,697,116,598,110,305,698,121,203,224) then 'Womenswear' else dpd.div_descr end                             div_descr, 
+    CASE WHEN WSLV.dept_id in (701,702,703) then 710 --Moving departments aound and regrouping per request
+         when WSLV.dept_id in (114,597,697,116,598,110,305,698,121,203,224) then 1000 else wslv.dept_id end                                                      dept_id,
+    CASE WHEN WSLV.dept_id in (114,597,697,116,598,110,305,698,121,203,224) then 'OTHER' 
+         WHEN WSLV.dept_id in (701,702,703) then 'WW RI Beauty' else dpd.dept_descr end                                                                          dept_descr,
+    'MD'                                                                                                                                                         FP_MD,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 then wslv.loss_cost_gbp_md_exjob else 0 end)                                                                   MD_TY_LOSS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 and wslv.loss_cost_gbp_md_exjob < 0 then wslv.loss_cost_gbp_md_exjob else 0 end)                               MD_TY_LOSS_SHORTAGE,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 and wslv.loss_cost_gbp_md_exjob > 0 then wslv.loss_cost_gbp_md_exjob else 0 end)                               MD_TY_LOSS_SURPLUS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 then wslv.loss_cost_gbp_md_exjob else 0 end)                                                                   MD_LY_LOSS,
+    MD_LY_LOSS  + MS.LY_LOSS_VALUE_SURPLUS                                                                                                                       MD_LY_LOSS_LFL,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 and wslv.loss_cost_gbp_md_exjob < 0 then wslv.loss_cost_gbp_md_exjob else 0 end)                               MD_LY_LOSS_SHORTAGE,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 and wslv.loss_cost_gbp_md_exjob > 0 then wslv.loss_cost_gbp_md_exjob else 0 end)  + MS.LY_LOSS_VALUE_SURPLUS   MD_LY_LOSS_SURPLUS, 
+    MD_TY_LOSS - MD_LY_LOSS                                                                                                                                      MD_CHANGE_IN_LOSS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 then wslv.sales_value_gbp_md else 0 end)                                                                       MD_TY_SALES,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 then wslv.sales_value_gbp_md else 0 end)                                                                       MD_LY_SALES,
+    MD_LY_SALES + MS.LY_SALES_VALUE_SURPLUS                                                                                                                      MD_LY_SALES_LFL,
+    iff(MD_TY_SALES = 0,0,MD_TY_LOSS/MD_TY_SALES)                                                                                                                MD_TY_LOSS_PCT_SALES,
+    iff(MD_LY_SALES_LFL = 0,0,MD_LY_LOSS_LFL/MD_LY_SALES_LFL)                                                                                                    MD_LY_LOSS_PCT_SALES,
+    MD_TY_LOSS_PCT_SALES - MD_LY_LOSS_PCT_SALES                                                                                                                  MD_CHANGE_IN_LOSS_PCT_SALES,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 then wslv.loss_units_md_exjob else 0 end)                                                                      MD_TY_LOSS_UNITS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 and wslv.loss_units_md_exjob < 0 then wslv.loss_units_md_exjob else 0 end)                                     MD_TY_LOSS_SHORTAGE_units,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 and wslv.loss_units_md_exjob > 0 then wslv.loss_units_md_exjob else 0 end) + MS.LY_LOSS_UNITS_SURPLUS          MD_TY_LOSS_SURPLUS_units,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 then wslv.loss_units_md_exjob else 0 end)                                                                      MD_LY_LOSS_UNITS,
+    MD_LY_LOSS_UNITS + MS.LY_LOSS_UNITS_SURPLUS                                                                                                                  MD_LY_LOSS_UNITS_LFL,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 and wslv.loss_units_md_exjob < 0 then wslv.loss_units_md_exjob else 0 end)                                     MD_LY_LOSS_SHORTAGE_units,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 and wslv.loss_units_md_exjob > 0 then wslv.loss_units_md_exjob else 0 end)                                     MD_LY_LOSS_SURPLUS_units,     
+    MD_TY_LOSS_UNITS - MD_LY_LOSS_UNITS_LFL                                                                                                                      MD_CHANGE_IN_LOSS_UNITS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2025 then wslv.sales_units_md else 0 end)                                                                           MD_TY_SALES_UNITS,
+    sum(case when left(wslv.merch_yr_wk,4) = 2024 then wslv.sales_units_md else 0 end)                                                                           MD_LY_SALES_UNITS,
+    MD_LY_SALES_UNITS + MS.LY_SALES_UNITS_SURPLUS                                                                                                                MD_LY_SALES_UNITS_LFL,
+    iff(MD_TY_SALES_UNITS = 0,0,MD_TY_LOSS_UNITS/MD_TY_SALES_UNITS)                                                                                              MD_TY_LOSS_PCT_SALES_UNITS,
+    iff(MD_LY_SALES_UNITS_LFL = 0,0,MD_LY_LOSS_UNITS_LFL/MD_LY_SALES_UNITS_LFL)                                                                                  MD_LY_LOSS_PCT_SALES_UNITS_LFL,
+    MD_TY_LOSS_PCT_SALES_UNITS - MD_LY_LOSS_PCT_SALES_UNITS_LFL                                                                                                  MD_CHANGE_IN_LOSS_PCT_SALES_UNITS
+
+from "RI_SANDL_DB"."RAW_DATA"."WEEKLY_STOCKTAKE_LOSS_VW" wslv
+
+join locations dmo using (location_id)
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_PRODUCT_DEPT" dpd
+on dpd.dept_id = wslv.dept_id
+
+join weeks
+on weeks.merch_yr_wk = wslv.merch_yr_wk
+
+full outer join MD_Surplus MS
+on MS.location_id = wslv.location_id
+and MS.dept_id = wslv.dept_id
+
+where wslv.dept_id not in (132,230,517)
+
+group by
+
+    dmo.territory,
+    dmo.market,
+    wslv.location_id,
+    dmo.location_descr,
+    dmo.LFL_STATUS,
+    dmo.profile,
+    dmo.finance_grading,
+    dmo.SCO_Flag,
+    dmo.ICP_Status,
+    dmo.tagging_status,
+    dpd.div_descr,
+    wslv.dept_id,
+    dpd.dept_descr,
+    MS.LY_LOSS_VALUE_SURPLUS,
+    MS.LY_SALES_VALUE_SURPLUS,
+    MS.LY_LOSS_UNITS_SURPLUS,
+    MS.LY_SALES_UNITS_SURPLUS
+
+having (case when MD_TY_LOSS = 0 and MD_LY_LOSS_LFL = 0 and MD_TY_LOSS_UNITS = 0 and MD_LY_SALES_UNITS_LFL = 0 
+and MD_TY_SALES = 0 and MD_LY_SALES_LFL = 0 and MD_TY_SALES_UNITS = 0 and MD_LY_LOSS_UNITS_LFL = 0 then 1 else 0 end) = 0
+
+order by 
+
+    wslv.location_id,
+    wslv.dept_id
+),
+
+-- COMBINING INTO A SINGLE CTE
+
+all_losses as (
+
+select *
+
+from full_price
+
+UNION ALL
+
+select 
+
+    reporting_week,
+    reporting_period,
+    territory,
+    market,
+    location_id,
+    location_descr,
+    LFL_STATUS,
+    profile,
+    finance_grading,
+    SCO_Flag,
+    ICP_Status,
+    tagging_status,
+    div_descr,
+    dept_id,
+    dept_descr,
+    FP_MD,
+    MD_TY_LOSS,
+    MD_TY_LOSS_SHORTAGE,
+    MD_TY_LOSS_SURPLUS,
+    MD_LY_LOSS_LFL,
+    MD_LY_LOSS_SHORTAGE,
+    MD_LY_LOSS_SURPLUS, 
+    MD_CHANGE_IN_LOSS,
+    MD_TY_SALES,
+    MD_LY_SALES_LFL,
+    MD_TY_LOSS_PCT_SALES,
+    MD_LY_LOSS_PCT_SALES,
+    MD_CHANGE_IN_LOSS_PCT_SALES,
+    MD_TY_LOSS_UNITS,
+    MD_TY_LOSS_SHORTAGE_units,
+    MD_TY_LOSS_SURPLUS_units,
+    MD_LY_LOSS_UNITS_LFL,
+    MD_LY_LOSS_SHORTAGE_units,
+    MD_LY_LOSS_SURPLUS_units,     
+    MD_CHANGE_IN_LOSS_UNITS,
+    MD_TY_SALES_UNITS,
+    MD_LY_SALES_UNITS_LFL,
+    MD_TY_LOSS_PCT_SALES_UNITS,
+    MD_LY_LOSS_PCT_SALES_UNITS_LFL,
+    MD_CHANGE_IN_LOSS_PCT_SALES_UNITS
+
+from markdown
+
+)
+
+-- Main outpuut which is in the correct format for copying and pasting into the report. 
+
+select
+
+    all_losses.reporting_week,
+    all_losses.reporting_period,
+    all_losses.location_id,
+    all_losses.location_descr,
+    concat(all_losses.location_id, ':', all_losses.location_descr)                                      store_name,
+    dmo.store_postcode,
+    dmo.city,
+    dmo.state,
+    dmo.market,
+    dmo.territory,
+    dmo.LFL_STATUS,
+    dmo.profile,
+    dmo.finance_grading,
+    dmo.SCO_Flag,
+    dmo.ICP_Status,
+    dmo.tagging_status,
+    div_descr, 
+    ROUND(dept_id,0)                                                                                    DEPT_NO,
+    dept_descr,
+    concat(ROUND(dept_id,0), ': ', dept_descr)                                                           department,
+    FP_MD,
+    sum(TY_LOSS)                                                                                        TY_TOTAL_LOSS,
+    sum(LY_LOSS)                                                                                        LY_TOTAL_LOSS,
+    TY_TOTAL_LOSS - LY_TOTAL_LOSS                                                                       VAR_LOSS,
+    SUM(TY_LOSS_UNITS)                                                                                  TY_TOTAL_LOSS_UNITS,
+    SUM(LY_LOSS_UNITS)                                                                                  LY_TOTAL_LOSS_UNITS,
+    TY_TOTAL_LOSS_UNITS - LY_TOTAL_LOSS_UNITS                                                           VAR_LOSS_UNITS,
+    SUM(TY_SALES)                                                                                       TY_TOTAL_SALES,
+    SUM(LY_SALES)                                                                                       LY_TOTAL_SALES,
+    TY_TOTAL_SALES - LY_TOTAL_SALES                                                                     VAR_SALES_VALUE,
+    SUM(TY_SALES_UNITS)                                                                                 TY_TOTAL_SALES_UNITS,
+    SUM(LY_SALES_UNITS)                                                                                 LY_TOTAL_SALES_UNITS,
+    TY_TOTAL_SALES_UNITS - LY_TOTAL_SALES_UNITS                                                         VAR_SALES_UNITS
+
+from all_losses
+
+join locations dmo using (location_id)
+
+group by
+
+    all_losses.reporting_week,
+    all_losses.reporting_period,
+    all_losses.location_id,
+    all_losses.location_descr,
+    dmo.store_postcode,
+    dmo.city,
+    dmo.state,
+    dmo.market,
+    dmo.territory,
+    dmo.LFL_STATUS,
+    dmo.profile,
+    dmo.finance_grading,
+    dmo.SCO_Flag, 
+    dmo.ICP_Status,
+    dmo.Tagging_Status,
+    div_descr, 
+    dept_id,
+    dept_descr,
+    FP_MD
+
+having 
+
+(case when TY_TOTAL_LOSS = 0 and LY_TOTAL_LOSS = 0 and TY_TOTAL_LOSS_UNITS = 0 and LY_TOTAL_LOSS_UNITS = 0 
+       and TY_TOTAL_SALES = 0 and LY_TOTAL_SALES = 0 and TY_TOTAL_SALES_UNITS = 0 and LY_TOTAL_SALES_UNITS = 0 then 1 else 0 end) = 0
+    
+order by
+
+    FP_MD,
+    location_id,
+    dept_id
+
+)
+;
+-- ===========================================================================================================================================================================================
+-- ===========================================================================================================================================================================================
+-- From the view above, create a table
+-- ===========================================================================================================================================================================================
+-- ===========================================================================================================================================================================================
+
+create or replace table RI_SANDL_DB.PUBLISHED_DATA.POWER_BI_STOCKTAKE_LOSS as (
+
+select *
+
+from RI_SANDL_DB.RAW_DATA.POWER_BI_STOCKTAKE_LOSS_VW
+)
+;
+
+-- ===========================================================================================================================================================================================
+-- ===========================================================================================================================================================================================
+-- INCIDENTS
+-- ===========================================================================================================================================================================================
+-- ===========================================================================================================================================================================================
+
+create or replace view RI_SANDL_DB.RAW_DATA.POWER_BI_INCIDENTS_VW AS (
+
+WITH WEEKS AS (
+	SELECT
+		MERCH_YR_WK WEEK,
+        FIN_PD,
+		MAX(CAL_DT) SAT_DATE
+	FROM
+		RI_NGBI_DB.PUBLISHED_DATA.DIM_TIME
+	WHERE
+		CAL_DT <=CURRENT_DATE() 
+	AND
+		MERCH_YR_WK >= 202501
+	GROUP BY
+		DIM_TIME.MERCH_YR_WK,
+        FIN_PD
+    ORDER BY
+		DIM_TIME.MERCH_YR_WK
+  
+),
+  
+FIRST_WEEK AS (
+
+	SELECT
+		MIN(SAT_DATE) FIRST_SAT
+	FROM
+		WEEKS
+) 
+
+SELECT
+	INCIDENTS_UPLOAD.LOCATIONNUMBER,
+	WEEKS.WEEK,	
+    WEEKS.FIN_PD,
+	DATEADD(DAY,-52*7,FIRST_WEEK.FIRST_SAT  - 6) first_LY,
+	DATEADD(DAY,-52*7,WEEKS.SAT_DATE) last_LY,
+	FIRST_WEEK.FIRST_SAT - 6 first_TY,
+	WEEKS.SAT_DATE last_ty,
+	INCIDENTS_UPLOAD.INCIDENTCATEGORY,
+	SUM(CASE WHEN REPORTDATE BETWEEN first_LY AND last_LY THEN 1 ELSE 0 END) LY_INCIDENTS,	
+	SUM(CASE WHEN REPORTDATE BETWEEN first_TY AND last_ty THEN 1 ELSE 0 END) TY_INCIDENTS,
+    SUM(CASE WHEN REPORTDATE BETWEEN first_LY AND last_Ly THEN VALUEOFLOSS ELSE 0 END) LY_INCIDENTS_VALUE_LOSS,
+    SUM(CASE WHEN REPORTDATE BETWEEN first_TY AND last_ty THEN VALUEOFLOSS ELSE 0 END) TY_INCIDENTS_VALUE_LOSS,	
+	LU_LOCATION_ID_RRM_CLOSED.RANKING,
+	DIM_ORG.DISTRICT_DESCR TERRITORY,
+	DIM_ORG.AREA_DESCR MARKET,
+	concat(dim_org.location_id, ':', dim_org.location_descr) STORE_NAME, 
+	DIM_ATTR_ORG.LOCATION_SHOP STORE_LOCATION,
+    DIM_ATTR_ORG.ZIP           STORE_POSTCODE
+FROM
+	FIRST_WEEK,WEEKS, "RI_SANDL_DB"."PUBLISHED_DATA"."INCIDENTS_UPLOAD" AS INCIDENTS_UPLOAD
+JOIN
+	"RI_SANDL_DB"."RAW_DATA"."LU_LOCATION_ID_RRM_CLOSED" AS LU_LOCATION_ID_RRM_CLOSED
+	ON INCIDENTS_UPLOAD.LOCATIONNUMBER = LU_LOCATION_ID_RRM_CLOSED.STORENUMBER	
+JOIN
+	RI_NGBI_DB.PUBLISHED_DATA.DIM_ORG
+	ON INCIDENTS_UPLOAD.LOCATIONNUMBER = DIM_ORG.LOCATION_ID
+JOIN
+	RI_NGBI_DB.PUBLISHED_DATA.DIM_ATTR_ORG
+	ON DIM_ORG.SK_LOCATION_ID = DIM_ATTR_ORG.SK_LOCATION_ID
+WHERE
+	LU_LOCATION_ID_RRM_CLOSED.CLOSED IS NULL
+    AND INCIDENTS_UPLOAD.INCIDENTCATEGORY IN ('Bulk Theft','ORC - Bulk Theft', 'Verbal Abuse / Anti-Social Behaviour','Physical Violence','Shoplifting') 
+GROUP BY
+  	INCIDENTS_UPLOAD.LOCATIONNUMBER,
+	WEEKS.WEEK,
+    WEEKS.FIN_PD,
+    FIRST_WEEK.FIRST_SAT,
+    WEEKS.SAT_DATE,
+    INCIDENTS_UPLOAD.INCIDENTCATEGORY,
+  	LU_LOCATION_ID_RRM_CLOSED.RANKING,
+	DIM_ORG.DISTRICT_DESCR,
+	DIM_ORG.AREA_DESCR,
+    DIM_ORG.LOCATION_ID,
+    DIM_ORG.LOCATION_DESCR,
+	DIM_ATTR_ORG.LOCATION_SHOP,
+    DIM_ATTR_ORG.ZIP
+ 
+ ORDER BY 
+ 
+    WEEK,
+    LOCATIONNUMBER,
+    INCIDENTCATEGORY
+ 
+);
+
+-- Now Creating the table from the view
+
+create or replace table RI_SANDL_DB.PUBLISHED_DATA.POWER_BI_INCIDENTS as (
+
+select *
+
+from RI_SANDL_DB.RAW_DATA.POWER_BI_INCIDENTS_VW
+
+where WEEK = 202508 --CHANGE TO FINAL WEEK OF THE PERIOD
+
+);
