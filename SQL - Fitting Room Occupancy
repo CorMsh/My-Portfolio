@@ -1,0 +1,275 @@
+-- Now FR Occupancy 
+create or replace view "RI_SANDL_DB"."RAW_DATA"."POWER_BI_CRAVE_FR_OCCUPANCY_VW" as (
+-- ==========================================================================================================================================================================================
+-- ==========================================================================================================================================================================================
+--                                                                         CRAVE FITTING ROOM OCCUPANCY - 1 Week ALL STORES
+-- ==========================================================================================================================================================================================
+-- ==========================================================================================================================================================================================
+
+
+-- 1. For each session, get the min and max time for each unique shopper id
+with session_times_detail as (
+
+select
+
+    dmo.district_descr                                                                              territory,
+    dmo.area_descr                                                                                  market,
+    cvr.location_id,
+    dmo.location_descr,
+    cvr.fitting_room_area,
+    cvr.fitting_room_name,
+    case when dmt.cal_day_of_wk = 1 then '1. Sunday' 
+         when dmt.cal_day_of_wk = 2 then '2. Monday'
+         when dmt.cal_day_of_wk = 3 then '3. Tuesday'
+         when dmt.cal_day_of_wk = 4 then '4. Wednesday'
+         when dmt.cal_day_of_wk = 5 then '5. Thursday'
+         when dmt.cal_day_of_wk = 6 then '6. Friday'
+         when dmt.cal_day_of_wk = 7 then '7. Saturday' end                                          day_of_the_week,
+    cvr.date,
+    cvr.unique_shopper_id,
+    to_time(convert_timezone('UTC' ,'Europe/London', cvr.date_and_time::timestamp_ntz))             start_local_time,
+    to_time(convert_timezone('UTC' ,'Europe/London', cvr.end_time::timestamp_ntz))                  end_local_time,
+    dao.zip                                                                                         store_postcode
+
+from "RI_SANDL_DB"."RAW_DATA"."CRAVE_SVI_VISITS_RAW_VW" cvr
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_ORG" dmo
+on dmo.location_id = cvr.location_id
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_ATTR_ORG" dao using (sk_location_id)
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_TIME" dmt
+on dmt.cal_dt = cvr.date
+
+join "RI_SANDL_DB"."RAW_DATA"."STORE_OPERATION_TIMES" sot
+on sot.location_id = dmo.location_id
+and sot.cal_dt = dmt.cal_dt 
+
+where dmt.fin_yr_wk = 202452
+and  to_time(cvr.date_and_time) between sot.opening_time and sot.closing_time
+and to_time(cvr.end_time) <= sot.closing_time
+--and cvr. date = '2023-12-09'
+--cvr.location_id = 63
+--and unique_shopper_id = 1472017
+
+),
+
+-- This CTE gives the start and end time of the session for each unique_shopper_id. 
+
+session_time as (
+
+    select
+
+        territory,
+        market,
+        store_postcode,
+        location_id,
+        location_descr,
+        fitting_room_area,
+        fitting_room_name,
+        day_of_the_week,
+        date,
+        unique_shopper_id,
+        min(start_local_time)       session_start_time,
+        min(end_local_time)         session_end_time
+
+    from session_times_detail
+
+   -- where fitting_room_name = 'Womens 1'
+
+    group by 
+
+        territory,
+        market,
+        store_postcode,
+        location_id,
+        location_descr,
+        fitting_room_area,
+        fitting_room_name,
+        day_of_the_week,
+        date,
+        unique_shopper_id
+
+    order by session_start_time
+
+),
+
+-- This CTE groups the times into hourly bins.
+
+grouped_visits as (
+
+select
+
+        territory,
+        market,
+        store_postcode,
+        location_id,
+        location_descr,
+        fitting_room_area,
+        fitting_room_name,
+        day_of_the_week,
+        date,
+        unique_shopper_id,
+        session_start_time,
+        session_end_time,
+        case when date_trunc('HOUR',session_start_time) <> date_trunc('HOUR',session_end_time) then 1 else 0 end hour_crossover_flag, -- A flag to signal when a session crosses into a different hourly window
+        date_trunc('HOUR',session_start_time)                                                                                           time_period_lower_bound, --grouping times into hourly windows
+        timestampadd('HOUR', 1 , time_period_lower_bound)                                                                               time_period_upper_bound,
+        concat(lpad(time_period_lower_bound,2,'0'), '-', lpad(time_period_upper_bound,2,'0'))                                           first_time_period, -- creating a first one. LPAD function adds a leading 0 to the time so that it can be sorted in chronologocial order
+        iff(hour_crossover_flag = 0, timediff('MINUTES',session_start_time,session_end_time),
+        timediff('MINUTES',session_start_time,time_period_upper_bound))                                                                 fr_visit_duration_1,
+        iff(hour_crossover_flag = 1, timediff('MINUTES',time_period_upper_bound,session_end_time),0)                                    fr_visit_duration_2,
+        iff(fr_visit_duration_2 <> 0, timestampadd('HOUR', 1 , time_period_lower_bound), null)                                          second_lower_bound_time_period,
+        timestampadd('HOUR', 1 , second_lower_bound_time_period)                                                                        second_upper_bound_time_period,
+        concat(lpad(second_lower_bound_time_period,2,'0'), '-', lpad(second_upper_bound_time_period,2,'0'))                             second_time_period,
+        iff(fr_visit_duration_2 >=60, timestampadd('HOUR', 1 , second_lower_bound_time_period), null)                                   third_lower_bound_time_period,
+        timestampadd('HOUR', 1 , third_lower_bound_time_period)                                                                         third_upper_bound_time_period,
+        concat(lpad(third_lower_bound_time_period,2,'0'), '-', lpad(third_upper_bound_time_period,2,'0'))                               third_time_period,
+        iff(fr_visit_duration_2 >=60, fr_visit_duration_2 - 60, null)                                                                   fr_visit_duration_3,
+        iff(fr_visit_duration_2 >=60, 60, fr_visit_duration_2)                                                                          updated_fr_visit_duration_2
+        
+from session_time
+
+--where fitting_room_name = 'Womens 1'
+
+),
+
+-- Using a union query to get all of the visits together in one column by time period for every fitting room. 
+
+fr_visits as (
+
+select 
+
+        territory,
+        market,
+        store_postcode,
+        location_id,
+        location_descr,
+        concat(location_id, ': ', location_descr)   store_name,
+        fitting_room_area,
+        fitting_room_name,
+        day_of_the_week,
+        date,
+        first_time_period                           time_period,
+        sum(fr_visit_duration_1)                    time_in_fitting_room
+
+from grouped_visits
+
+where time_period is not null
+
+group by 
+        territory,
+        market,
+        store_postcode,
+        location_id,
+        location_descr,
+        fitting_room_area,
+        fitting_room_name,
+        day_of_the_week,
+        date,
+        first_time_period
+
+union
+
+select 
+        territory,
+        market,
+        store_postcode,
+        location_id,
+        location_descr,
+        concat(location_id, ': ', location_descr)   store_name,
+        fitting_room_area,
+        fitting_room_name,
+        day_of_the_week,
+        date,
+        second_time_period                          time_period,
+        sum(updated_fr_visit_duration_2)            time_in_fitting_room
+
+from grouped_visits
+
+where time_period is not null
+
+group by 
+        territory,
+        market,
+        store_postcode,
+        location_id,
+        location_descr,
+        fitting_room_area,
+        fitting_room_name,
+        day_of_the_week,
+        date,
+        time_period
+        
+union
+
+select 
+        territory,
+        market,
+        store_postcode,
+        location_id,
+        location_descr,
+        concat(location_id, ': ', location_descr)   store_name,
+        fitting_room_area,
+        fitting_room_name,
+        day_of_the_week,
+        date,
+        third_time_period                           time_period,
+        sum(fr_visit_duration_3)                    time_in_fitting_room
+
+from grouped_visits
+
+where time_period is not null
+
+group by 
+        territory,
+        market,
+        store_postcode,
+        location_id,
+        location_descr,
+        fitting_room_area,
+        fitting_room_name,
+        day_of_the_week,
+        date,
+        time_period
+
+order by
+
+    location_id,
+    date,
+    fitting_room_area,
+    fitting_room_name,
+    time_period
+
+)
+
+select
+
+        territory,
+        market,
+        store_postcode,
+        location_id,
+        location_descr,
+        store_name,
+        fitting_room_area,
+        fitting_room_name,
+        day_of_the_week,
+        date,
+        time_period,
+        case when time_in_fitting_room > 60 then 60 else time_in_fitting_room end   fr_occupancy_duration    
+
+from fr_visits
+
+)
+
+;
+
+create or replace table "RI_SANDL_DB"."PUBLISHED_DATA"."POWER_BI_CRAVE_FR_OCCUPANCY" as (
+
+select *
+
+from "RI_SANDL_DB"."RAW_DATA"."POWER_BI_CRAVE_FR_OCCUPANCY_VW"
+)
+
+;
+
