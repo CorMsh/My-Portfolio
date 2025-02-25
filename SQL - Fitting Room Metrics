@@ -1,0 +1,896 @@
+-- ==================================================================================================================================================================================================
+-- ==================================================================================================================================================================================================
+--                                                                          CRAVE EOP REPORT
+-- ==================================================================================================================================================================================================
+-- ==================================================================================================================================================================================================
+
+-- Request from Sam. As part of EOP reporting looking at 
+
+-- capture %,	
+-- FR % that led to sale
+-- FR request %
+-- missed % 
+
+--1. Need to distinguish between LFL stores and Non LFL Crave Stores. 
+-- A LFL stores is one that have had Crave installed for a full year. 
+-- Non LFL need to be included in the report from the period where they have had crave installed for one full period.
+-- To do this, for every store, get every single day that they have had crave, then get every week, the sk corresponding to the week and then their starts and end period
+
+with crave_store_dates as (
+
+select distinct
+
+        dmo.sk_location_id,
+        cpb.location_id,
+        cpb.location_descr,
+        dmt.sk_cal_dt,
+        dmt.cal_dt           days_with_crave,
+        dmt.sk_merch_yr_wk, 
+        dmt.merch_yr_wk,
+        dmt.fin_yr_pd
+
+from "RI_SANDL_DB"."RAW_DATA"."CRAVE_POS_BIBLE" cpb
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_TIME" dmt
+on dmt.cal_dt >= cpb.from_date
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_ORG" dmo
+on dmo.location_id = cpb.location_id
+
+where dmt.cal_dt <= current_date() - 7
+and dmt.cal_dt <> '2024-07-17' -- DUE TO AN ISSUE WITH SUNGALSSES ON THIS DAY, THIS DATE NEEDS TO BE PERMANENTLY EXCLUDED FROM THE RESULTS
+and cpb.location_id not in (59,120)
+
+order by   
+
+            cpb.location_id,
+            dmt.cal_dt
+),
+
+-- From the above table, for each store what is the beginning and end week.
+
+crave_store_weeks as (
+
+select
+
+    location_id,
+    location_descr,
+    min(csd.sk_merch_yr_wk)     sk_first_week,
+    min(csd.merch_yr_wk)        first_week,
+    min(csd.fin_yr_pd)          first_period,
+    max(csd.sk_merch_yr_wk)     sk_last_week,
+    max(csd.merch_yr_wk)        last_week,
+    max(csd.fin_yr_pd)          last_period,
+
+from crave_store_dates  csd
+      
+group by
+
+    csd.location_id,
+    csd.location_descr
+
+order by 
+
+    csd.location_id
+
+),
+
+-- Now that each store has their first and last week with crave calculated, need to determine their first period
+-- If a store had crave installed and activated/ in use half way through the period, they should only be included where they had crave for a full period. 
+-- Creating a CTE which gives the first and last week of each period
+
+pd_first_last_wk as (
+
+select distinct
+
+        fin_yr_pd,
+        min(sk_merch_yr_wk)     sk_first_wk_pd,
+        min(merch_yr_wk)        first_wk_pd,
+        max(sk_merch_yr_wk)     sk_last_wk_pd,
+        max(merch_yr_wk)        last_wk_pd
+        
+
+from "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_TIME"
+
+group by 
+
+    fin_yr_pd
+
+order by fin_yr_pd
+),
+
+crave_timespan as (
+
+select
+
+    csw.location_id,
+    csw.location_descr,
+    csw.first_period,
+    csw.sk_first_week                                                                               sk_first_week_with_crave,
+    csw.first_week                                                                                  first_weeek_with_crave,
+    pflw_start.sk_first_wk_pd,   
+    pflw_start.first_wk_pd,
+    csw.last_period,
+    csw.sk_last_week                                                                                sk_last_week_with_crave,
+    csw.last_week                                                                                   last_week_with_crave,
+    pflw_end.sk_last_wk_pd,
+    pflw_end.last_wk_pd,
+    case when first_weeek_with_crave <> pflw_start.first_wk_pd then pflw_start.sk_first_wk_pd + 4 --This means any store that starts part through the period will be included from the next one
+         else pflw_start.sk_first_wk_pd end                                                         sk_reporting_start_week,
+    case when sk_last_week_with_crave - sk_reporting_start_week >= 52 then 'LFL'
+         else 'Non-LFL' end                                                                         Crave_LFL_Status
+         
+
+from crave_store_weeks csw
+
+join pd_first_last_wk pflw_start
+on csw.first_period = pflw_start.fin_yr_pd
+
+join pd_first_last_wk pflw_end
+on csw.last_period = pflw_end.fin_yr_pd
+),
+
+-- Using the above CTE, get the first week, last week, first period and last period and all the days in which stores had Crave
+
+crave_time_window as (
+
+select
+
+    cn.location_id,
+    cn.location_descr,
+    cn.Crave_LFL_Status,
+    cn.sk_reporting_start_week,
+    dtmyw.merch_yr_wk               reporting_start_wk,
+    dmt_pd_start.fin_yr_pd          reporting_start_pd,
+    cn.sk_last_week_with_crave      sk_reporting_end_wk,
+    cn.last_week_with_crave         reporting_end_wk,
+    dmt_pd_end.fin_yr_pd            reporting_end_pd
+
+from crave_timespan cn
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_TIME_MERCH_YR_WK" dtmyw
+on dtmyw.sk_merch_yr_wk = sk_reporting_start_week
+
+join (select distinct
+
+            sk_merch_yr_wk,
+            fin_yr_pd
+     
+        from "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_TIME") dmt_pd_start
+on dmt_pd_start.sk_merch_yr_wk = dtmyw.sk_merch_yr_wk
+
+join (select distinct
+
+            sk_merch_yr_wk,
+            fin_yr_pd
+     
+        from "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_TIME") dmt_pd_end
+on dmt_pd_end.sk_merch_yr_wk = cn.sk_last_week_with_crave
+
+order by
+
+    cn.location_id
+),
+
+-- Now that I have the first and last weeks for each store and their LFL status, creating 2 time windows; one rolling year one and one prior period one for each store
+
+crave_window_weeks as (
+
+select
+
+    ctw.location_id,
+    ctw.location_descr,
+    ctw.Crave_LFL_Status,
+    ctw.sk_reporting_end_wk,
+    ctw.reporting_end_wk,
+    ctw.reporting_end_pd,
+    case when ctw.Crave_LFL_Status = 'LFL' then ctw.sk_reporting_end_wk - 51
+         else ctw.sk_reporting_start_week
+         end                                                                    sk_reporting_start_wk_window,
+    dmt.merch_yr_wk                                                             reporting_start_wk_window,
+    dmt.fin_yr_pd                                                               reporting_start_pd_window
+
+from crave_time_window ctw
+
+join (select distinct
+
+                sk_merch_yr_wk,
+                merch_yr_wk,
+                fin_yr_pd
+                
+      from "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_TIME") dmt
+on dmt.sk_merch_yr_wk = sk_reporting_start_wk_window
+),
+
+-- The nect 2 CTEs are to get the weeks for the previous period only
+
+pd_first_last_wk as (
+
+select distinct
+
+        fin_yr_pd,
+        min(sk_merch_yr_wk)     sk_first_wk_pd,
+        min(merch_yr_wk)        first_wk_pd,
+        max(sk_merch_yr_wk)     sk_last_wk_pd,
+        max(merch_yr_wk)        last_wk_pd
+        
+
+from "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_TIME"
+
+where fin_yr_pd = (select distinct fin_yr_pd from "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_TIME" where cal_dt = current_date()-7)
+
+group by 
+
+    fin_yr_pd
+
+order by fin_yr_pd
+),
+
+crave_timespan_lastperiod as (
+
+select
+
+    csw.location_id,
+    csw.location_descr,
+    case when csw.sk_first_week > pflw.sk_first_wk_pd then  pflw.sk_first_wk_pd + 4 
+         else pflw.sk_first_wk_pd end                                                               sk_reporting_start_week,  
+    pflw.first_wk_pd,
+    csw.sk_last_week                                                                                sk_last_week_with_crave,
+    csw.last_week                                                                                   last_week_with_crave,
+    pflw.sk_last_wk_pd,
+    pflw.last_wk_pd,
+    csw.last_period
+         
+
+from crave_store_weeks csw
+
+join pd_first_last_wk pflw
+on csw.last_period = pflw.fin_yr_pd
+
+),
+
+-- Now that the first and last weeks and periods for each store has been determined, getting metrics. 
+-- Best to put it at week level for each store
+
+-- Starting with capture rate
+
+fr_visits as (
+
+select    
+
+        csd.sk_merch_yr_wk,
+        csd.merch_yr_wk,
+        cvr.location_id,
+        count(distinct unique_shopper_id)        number_visits
+
+from RI_SANDL_DB.RAW_DATA.CRAVE_SVI_VISITS_RAW_VW                  cvr
+                        
+join crave_store_dates csd
+on csd.days_with_crave = cvr.date
+and csd.location_id = cvr.location_id
+
+join "RI_SANDL_DB"."PUBLISHED_DATA"."STORE_OPERATION_TIMES" sot
+on sot.location_id = cvr.location_id
+and sot.cal_dt = csd.days_with_crave
+
+join ri_ngbi_db.published_data.dim_product_sku                         dps 
+on   cvr.sku = dps.sku_id  
+
+    where
+
+        to_time(cvr.date_and_time) between sot.opening_time and sot.closing_time
+        and to_time(cvr.end_time) <= sot.closing_time
+        and dps.div_id not in (003,007,004)
+ 
+    group by
+
+        csd.sk_merch_yr_wk,
+        csd.merch_yr_wk,
+        cvr.location_id
+    
+    order by
+        cvr.location_id
+
+),
+
+footfall as (
+
+select
+
+    csd.sk_merch_yr_wk,
+    csd.merch_yr_wk,
+    flf.location_id     location_id,
+    sum(flf.exits)      footfall
+
+from "RI_NGBI_DB"."PUBLISHED_DATA"."FTT_LOCATION_FOOTFALL" flf
+
+join crave_store_dates csd
+on csd.location_id = flf.location_id
+and csd.days_with_crave = flf.date
+
+join "RI_SANDL_DB"."PUBLISHED_DATA"."STORE_OPERATION_TIMES" sot
+on sot.location_id = flf.location_id
+and sot.cal_dt = csd.days_with_crave
+
+join (select distinct 
+
+        location_id,
+        storezone_id,
+        case when location_id = 752 and storezone_id = 'EP 02' then 0 else 1 end storezone_flag --Due to technical issues, this zone has to be excluded from the footfall count
+
+    from "RI_NGBI_DB"."PUBLISHED_DATA"."FTT_LOCATION_FOOTFALL"
+
+    where location_id in (63,145,336,363,373,403,404,711,712,823,828,829,939,153,253,330,379,752,170,268,250,874,45,885,244,119,222,163,217,17) --ADD NEW LOCATIONS HERE IF NECESSARY
+    and (storezone_id like '%EP%' 
+    or storezone_id ilike '%Entrance%')
+    and storezone_flag = 1
+
+    order by location_id,
+             storezone_id
+             ) as storezones
+on storezones.location_id = flf.location_id
+and storezones.storezone_id = flf.storezone_id
+
+group by 
+
+         csd.sk_merch_yr_wk,
+         csd.merch_yr_wk,
+         flf.location_id
+
+order by flf.location_id
+
+),
+
+ytd_capture_rate as (
+
+select
+
+    cww.location_id,
+    cww.location_descr,
+    cww.Crave_LFL_Status,
+    sum(fvs.number_visits)                                          total_visits,
+    sum(footfall.footfall)                                          total_footfall,
+    iff(total_footfall = 0, null, total_visits/total_footfall)      ytd_capture_rate
+
+from crave_window_weeks cww
+
+join fr_visits fvs
+on fvs.location_id = cww.location_id
+and fvs.sk_merch_yr_wk between cww.sk_reporting_start_wk_window and cww.sk_reporting_end_wk
+
+join footfall
+on footfall.location_id = cww.location_id
+and footfall.sk_merch_yr_wk between cww.sk_reporting_start_wk_window and cww.sk_reporting_end_wk
+
+group by
+
+    cww.location_id,
+    cww.location_descr,
+    cww.Crave_LFL_Status
+),
+
+pd_capture_rate as (
+
+select
+
+    ctl.location_id,
+    ctl.location_descr,
+    sum(fvs.number_visits)                                          total_visits,
+    sum(footfall.footfall)                                          total_footfall,
+    iff(total_footfall = 0, null, total_visits/total_footfall)      pd_capture_rate
+
+from crave_timespan_lastperiod ctl
+
+join fr_visits fvs
+on fvs.location_id = ctl.location_id
+and fvs.sk_merch_yr_wk between ctl.sk_reporting_start_week and ctl.sk_last_week_with_crave
+
+join footfall
+on footfall.location_id = ctl.location_id
+and footfall.sk_merch_yr_wk between ctl.sk_reporting_start_week and ctl.sk_last_week_with_crave
+
+group by
+
+    ctl.location_id,
+    ctl.location_descr
+),
+
+-- Next metric, FR visits --> sale
+
+visit_transactions_by_sku as ( 
+
+select    
+        cvr.unique_shopper_id,
+        cvr.date,
+        cvr.date_and_time                                 start_time,
+        cvr.dwell_time_msec,
+        to_timestamp_ntz(cvr.date_and_time)               start_local_time,
+        to_timestamp_ntz(cvr.end_time)                    end_local_time,
+        cvr.location_id,
+        dps.sku_id,
+        cvr.item_price,
+        max(sal_qty)        sku_vis_sales_qty,
+        max(sal_retail_val) sku_vis_sales_value
+
+from 
+        ri_ngbi_db.published_data.FTT_SAL_SKU_LOC_TRANS                                        fsslt
+                        
+                        join ri_ngbi_db.published_data.dim_product_sku                         dps 
+                        on   fsslt.sk_sku_id = dps.sk_sku_id 
+                        join crave_store_dates csd
+                        on fsslt.sk_location_id = csd.sk_location_id
+                        and fsslt.sk_trans_cal_dt = csd.sk_cal_dt
+                        join RI_SANDL_DB.RAW_DATA.CRAVE_SVI_VISITS_RAW_VW                 cvr
+                        on         dps.sku_id = cvr.sku
+                            and     csd.location_id  = cvr.location_id
+                            and     csd.days_with_crave = cvr.date
+                            and     fsslt.pos_sale_dtm > cvr.date_and_time
+                            
+                where        fsslt.currency_id   = 'GBP'
+                and     timediff('MINUTES',end_local_time,fsslt.pos_sale_dtm) <15
+                and     fsslt.sal_qty       > 0 -- (gross sales)
+                and dps.div_id not in (003,007,004)
+ 
+    group by
+        cvr.unique_shopper_id,
+        cvr.date,
+        cvr.date_and_time,
+        cvr.dwell_time_msec,
+        cvr.end_time,
+        cvr.location_id,
+        dps.sku_id,
+        cvr.item_price
+    
+    order by
+        cvr.location_id  
+),
+
+visit_transactions as (
+
+select
+
+    vts.unique_shopper_id,
+    csd.sk_merch_yr_wk,
+    csd.merch_yr_wk,
+    csd.location_id,
+    sum(sku_vis_sales_value) vis_sales_value
+
+from visit_transactions_by_sku vts
+
+join crave_store_dates csd
+on csd.location_id = vts.location_id
+and csd.days_with_crave = vts.date
+
+group by 
+
+    vts.unique_shopper_id,
+    csd.sk_merch_yr_wk,
+    csd.merch_yr_wk,
+    csd.location_id
+
+),
+
+visit_stats as (  
+
+select
+
+    sk_merch_yr_wk,
+    merch_yr_wk,
+    location_id,
+    count(*)             converted_visits,
+    avg(vis_sales_value) ave_vis_sales_value
+      
+
+from
+    visit_transactions
+
+group by
+    
+    sk_merch_yr_wk,
+    merch_yr_wk,
+    location_id
+),
+
+fr_visits_to_sales as (
+
+select
+
+    vs.sk_merch_yr_wk,
+    vs.merch_yr_wk,
+    vs.location_id,
+    vs.converted_visits,
+    fvs.number_visits,
+    iff(number_visits = 0, 0, vs.converted_visits/fvs.number_visits)      pct_visits_to_sale
+
+from visit_stats vs
+
+join fr_visits fvs using (sk_merch_yr_wk, merch_yr_wk, location_id)
+
+),
+
+ytd_fr_visits_to_sales as (
+
+select
+
+    cww.location_id,
+    cww.location_descr,
+    cww.Crave_LFL_Status,
+    sum(vs.converted_visits)                                              total_sales_from_visits,
+    sum(fvs.number_visits)                                                total_visits,
+    iff(total_visits = 0, null, total_sales_from_visits/total_visits)     ytd_visits_to_sales
+
+from crave_window_weeks cww
+
+join visit_stats vs
+on vs.location_id = cww.location_id
+and vs.sk_merch_yr_wk between cww.sk_reporting_start_wk_window and cww.sk_reporting_end_wk
+
+join fr_visits fvs
+on fvs.location_id = cww.location_id
+and fvs.sk_merch_yr_wk between cww.sk_reporting_start_wk_window and cww.sk_reporting_end_wk
+
+group by
+
+    cww.location_id,
+    cww.location_descr,
+    cww.Crave_LFL_Status
+),
+
+pd_fr_visits_to_sales as (
+
+select
+
+    ctl.location_id,
+    ctl.location_descr,
+    sum(vs.converted_visits)                                              total_sales_from_visits,
+    sum(fvs.number_visits)                                                total_visits,
+    iff(total_visits = 0, null, total_sales_from_visits/total_visits)     pd_visits_to_sales
+
+from crave_timespan_lastperiod ctl
+
+join visit_stats vs
+on vs.location_id = ctl.location_id
+and vs.sk_merch_yr_wk between ctl.sk_reporting_start_week and ctl.sk_last_week_with_crave
+
+join fr_visits fvs
+on fvs.location_id = ctl.location_id
+and fvs.sk_merch_yr_wk between ctl.sk_reporting_start_week and ctl.sk_last_week_with_crave
+
+group by
+
+    ctl.location_id,
+    ctl.location_descr
+),
+
+-- Next fitting room request %. I think she means "FR Request Sales % of all requests"
+
+crave_requests as (
+
+select
+
+    crr.createdby                                                                    unique_shopper_id,
+    crr.location_id,
+    crr.fitting_room_area,
+    crr.fitting_room_name,
+    TO_TIMESTAMP(CRR.date_and_time)                                                  datetime,
+    crr.unique_request_id                                                            request_id,
+    crr.sku                                                                          requested_sku_id,
+    crr.product_id_external                                                          requested_product_id,
+    dps.option_id                                                                    requested_option_id,
+    dps.option_descr                                                                 requested_option_descr,
+    dps.dept_id                                                                      requested_department_id,
+    dps.dept_descr                                                                   requested_department,
+    crr.colour                                                                       requested_colour,
+    crr.size                                                                         requested_size,
+    crr.price                                                                        requested_product_price,
+    crr.request_type                                                                 type_of_request,
+    case when crr.request_type = 'CHECKOUT' then 'Y' else 'N' end                    checkout_request,
+    case when crr.request_type = 'ASSOCIATE' then 'Y' else 'N' end                   associate_request,
+    case when crr.request_type = 'ITEM' then 'Y' else 'N' end                        item_request
+
+from RI_SANDL_DB.RAW_DATA.CRAVE_SVI_REQUESTS_RAW_VW crr
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_PRODUCT_SKU" dps
+on dps.sku_id = crr.sku
+
+join crave_store_dates csd
+on csd.location_id = crr.location_id
+and csd.days_with_crave = crr.date
+
+where item_request = 'Y'
+and (crr.REQUEST_STATUS <> 'MISSED'
+and (crr.RESPONSE_TIME is not null or crr.RESPONSE_TIME > 120)) 
+and dps.div_id not in (003,007,004)
+
+),
+
+request_sales as (
+
+select    
+        csd.sk_merch_yr_wk,
+        csd.merch_yr_wk,
+        csd.location_id,
+        csd.location_descr,
+        sum(case when size_requests.request_id is not null then sal_qty else 0 end)         size_req_sal_qty,
+        sum(case when size_requests.request_id is not null then sal_retail_val else 0 end)  size_req_val,
+        sum(case when size_requests.request_id is null then sal_qty else 0 end)             other_req_sal_qty,
+        sum(case when size_requests.request_id is null then sal_retail_val else 0 end)      other_req_val,
+        size_req_sal_qty + other_req_sal_qty                                                tot_req_sal_qty,
+        size_req_val + other_req_val                                                        tot_req_sal_val
+
+from 
+        ri_ngbi_db.published_data.FTT_SAL_SKU_LOC_TRANS                                        fsslt
+                        
+                        join ri_ngbi_db.published_data.dim_product_sku                         dps 
+                        on   fsslt.sk_sku_id = dps.sk_sku_id 
+                        join crave_store_dates csd
+                        on fsslt.sk_location_id = csd.sk_location_id
+                        and fsslt.sk_trans_cal_dt = csd.sk_cal_dt   
+                        join ri_sandl_db.raw_data.crave_svi_requests_raw_vw         crr
+                        on         dps.sku_id = crr.sku
+                            and     csd.location_id  = crr.location_id
+                            and     csd.days_with_crave = crr.date
+                        left join (
+
+                                select distinct request_id
+ 
+                                from crave_requests cr 
+
+                                left join "RI_SANDL_DB"."RAW_DATA"."CRAVE_SVI_VISITS_RAW_VW" cvr
+                                on cr.fitting_room_name = cvr.fitting_room_name
+                                and cr.datetime between to_timestamp(cvr.date_and_time) and to_timestamp(cvr.end_time)   
+
+                                join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_PRODUCT_SKU" dps
+                                on dps.sku_id = cvr.sku
+
+                                join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_PRODUCT_SKU" dps_req
+                                on dps_req.sku_id = cr.requested_sku_id
+
+                                where  dps.option_id = dps_req.option_id  
+       
+                                ) as size_requests 
+                        on size_requests.request_id = crr.unique_request_id
+    where        
+                        fsslt.currency_id   = 'GBP'
+                and     timediff('MINUTES',crr.date_and_time,fsslt.pos_sale_dtm ) <30
+                and     fsslt.sal_qty > 0 -- (gross sales)
+                and     dps.div_id not in (003,007,004)
+ 
+    group by
+
+        csd.sk_merch_yr_wk,
+        csd.merch_yr_wk,
+        csd.location_id,
+        csd.location_descr
+    
+    order by
+        csd.location_id
+),
+
+total_requests as (
+
+select
+
+    csd.sk_merch_yr_wk,
+    csd.merch_yr_wk,
+    csd.location_id,
+    count(crrv.unique_request_id) tot_requests
+
+from "RI_SANDL_DB"."RAW_DATA"."CRAVE_SVI_REQUESTS_RAW_VW" crrv
+
+join crave_store_dates csd
+on csd.location_id = crrv.location_id
+and csd.days_with_crave = crrv.date
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_PRODUCT_SKU" dps
+on dps.sku_id = crrv.sku
+
+where crrv.request_type = 'ITEM'
+and dps.div_id not in (003, 004, 007)
+
+group by 
+
+    csd.sk_merch_yr_wk,
+    csd.merch_yr_wk,
+    csd.location_id
+),
+
+ytd_fr_requests_to_sales as (
+
+select
+
+    cww.location_id,
+    cww.location_descr,
+    cww.Crave_LFL_Status,
+    sum(rs.tot_req_sal_qty)                                                     total_sales_from_requests,
+    sum(tr.tot_requests)                                                        total_requests,
+    iff(total_requests = 0, null, total_sales_from_requests/total_requests)     ytd_requests_to_sales
+
+from crave_window_weeks cww
+
+join request_sales rs
+on rs.location_id = cww.location_id
+and rs.sk_merch_yr_wk between cww.sk_reporting_start_wk_window and cww.sk_reporting_end_wk
+
+join total_requests tr
+on tr.location_id = cww.location_id
+and tr.sk_merch_yr_wk between cww.sk_reporting_start_wk_window and cww.sk_reporting_end_wk
+
+group by
+
+    cww.location_id,
+    cww.location_descr,
+    cww.Crave_LFL_Status
+),
+
+pd_fr_requests_to_sales as (
+
+select
+
+    ctl.location_id,
+    ctl.location_descr,
+    sum(rs.tot_req_sal_qty)                                                     total_sales_from_requests,
+    sum(tr.tot_requests)                                                        total_requests,
+    iff(total_requests = 0, null, total_sales_from_requests/total_requests)     pd_requests_to_sales
+
+from crave_timespan_lastperiod ctl
+
+join request_sales rs
+on rs.location_id = ctl.location_id
+and rs.sk_merch_yr_wk between ctl.sk_reporting_start_week and ctl.sk_last_week_with_crave
+
+join total_requests tr
+on tr.location_id = ctl.location_id
+and tr.sk_merch_yr_wk between ctl.sk_reporting_start_week and ctl.sk_last_week_with_crave
+
+group by
+
+    ctl.location_id,
+    ctl.location_descr
+),
+
+-- The final metric is missed request % 
+
+missed_requests as (
+
+select 
+
+    csd.sk_merch_yr_wk,
+    csd.merch_yr_wk,
+    crr.location_id,
+    count(request_type)    no_missed_requests   
+
+from "RI_SANDL_DB"."RAW_DATA"."CRAVE_SVI_REQUESTS_RAW_VW" crr
+
+join crave_store_dates csd
+on csd.location_id = crr.location_id
+and csd.days_with_crave = crr.date
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_PRODUCT_SKU" dps 
+on dps.sku_id = crr.sku
+
+where crr.request_status = 'MISSED'
+and crr.response_time > 120
+and dps.div_id not in (003,007,004)
+
+group by
+
+    csd.sk_merch_yr_wk,
+    csd.merch_yr_wk,
+    crr.location_id
+
+order by crr.location_id
+
+),
+
+ytd_missed_req_pct as (
+
+select
+
+    cww.location_id,
+    cww.location_descr,
+    cww.Crave_LFL_Status,
+    sum(mr.no_missed_requests)                                                  total_missed_requests,
+    sum(tr.tot_requests)                                                        total_requests,
+    iff(total_requests = 0, null, total_missed_requests/total_requests)     ytd_missed_req_pct
+
+from crave_window_weeks cww
+
+join missed_requests mr
+on mr.location_id = cww.location_id
+and mr.sk_merch_yr_wk between cww.sk_reporting_start_wk_window and cww.sk_reporting_end_wk
+
+join total_requests tr
+on tr.location_id = cww.location_id
+and tr.sk_merch_yr_wk between cww.sk_reporting_start_wk_window and cww.sk_reporting_end_wk
+
+group by
+
+    cww.location_id,
+    cww.location_descr,
+    cww.Crave_LFL_Status
+),
+
+pd_missed_req_pct as (
+
+select
+
+    ctl.location_id,
+    ctl.location_descr,
+    sum(mr.no_missed_requests)                                                  total_missed_requests,
+    sum(tr.tot_requests)                                                        total_requests,
+    iff(total_requests = 0, null, total_missed_requests/total_requests)         pd_missed_req_pct
+
+from crave_timespan_lastperiod ctl
+
+join missed_requests mr
+on mr.location_id = ctl.location_id
+and mr.sk_merch_yr_wk between ctl.sk_reporting_start_week and ctl.sk_last_week_with_crave
+
+join total_requests tr
+on tr.location_id = ctl.location_id
+and tr.sk_merch_yr_wk between ctl.sk_reporting_start_week and ctl.sk_last_week_with_crave
+
+group by
+
+    ctl.location_id,
+    ctl.location_descr
+)
+
+-- All metrics obtained, combine into a single output statement, ready to copy and paste into Excel
+-- I am losing left joins because it is possible for a store to have 0% missed requests therefore an inner join removes it from the output completely. 
+
+select
+
+    concat(ytd_capture_rate.location_id, ': ', ytd_capture_rate.location_descr)                                   store_name,
+    dmo.area_descr                                                                                                market,
+    dmo.district_descr                                                                                            territory,
+    ytd_capture_rate.Crave_LFL_Status,
+    --First, list out the last period metrics
+    pd_capture_rate.pd_capture_rate,
+    pd_fr_visits_to_sales.pd_visits_to_sales,
+    pd_fr_requests_to_sales.pd_requests_to_sales,
+    case when pd_missed_req_pct.pd_missed_req_pct is null then 0 else pd_missed_req_pct.pd_missed_req_pct end     pd_missed_req_pcnt,  
+    NULL,
+    -- Now YTD metrics
+    ytd_capture_rate.ytd_capture_rate,
+    ytd_fr_visits_to_sales.ytd_visits_to_sales,
+    ytd_fr_requests_to_sales.ytd_requests_to_sales,
+    ytd_missed_req_pct.ytd_missed_req_pct,
+    NULL,
+    -- Now comparison of prior period to YTD average
+    pd_capture_rate.pd_capture_rate - ytd_capture_rate.ytd_capture_rate                                           change_in_capture_rate,
+    pd_fr_visits_to_sales.pd_visits_to_sales - ytd_fr_visits_to_sales.ytd_visits_to_sales                         change_in_fr_visists_to_sales,
+    pd_fr_requests_to_sales.pd_requests_to_sales - ytd_fr_requests_to_sales.ytd_requests_to_sales                 change_in_requests_to_sales,
+    pd_missed_req_pcnt - ytd_missed_req_pct.ytd_missed_req_pct                                                    change_in_missed_req_pct
+
+from ytd_capture_rate 
+
+left join pd_capture_rate 
+on pd_capture_rate.location_id = ytd_capture_rate.location_id
+
+left join ytd_fr_visits_to_sales
+on ytd_fr_visits_to_sales.location_id  = ytd_capture_rate.location_id
+
+left join pd_fr_visits_to_sales
+on pd_fr_visits_to_sales.location_id  = ytd_capture_rate.location_id
+
+left join ytd_fr_requests_to_sales
+on ytd_fr_requests_to_sales.location_id  = ytd_capture_rate.location_id
+
+left join pd_fr_requests_to_sales
+on pd_fr_requests_to_sales.location_id  = ytd_capture_rate.location_id
+
+left join ytd_missed_req_pct
+on ytd_missed_req_pct.location_id  = ytd_capture_rate.location_id
+
+left join pd_missed_req_pct
+on pd_missed_req_pct.location_id  = ytd_capture_rate.location_id
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."DIM_ORG" dmo
+on dmo.location_id = ytd_capture_rate.location_id
+
+order by
+
+    ytd_capture_rate.Crave_LFL_Status,
+    ytd_capture_rate.location_id
